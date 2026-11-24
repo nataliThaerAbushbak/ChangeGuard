@@ -13,7 +13,7 @@ mkdir -p ~/.claude/skills && cp -r skills/changeguard ~/.claude/skills/
 mkdir -p .claude/skills && cp -r skills/changeguard .claude/skills/
 ```
 
-Requires Python 3.8+ and git. There are no other dependencies.
+Requires Python 3.8+ and git. There are no other dependencies. Works on Linux, macOS and Windows; see [SECURITY.md](SECURITY.md) for Windows filesystem limitations.
 
 ## Use
 

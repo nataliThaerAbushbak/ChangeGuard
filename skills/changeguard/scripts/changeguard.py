@@ -70,10 +70,11 @@ DEBUG_RE = re.compile(r"^\s*breakpoint\(\)|\bpdb\.set_trace\(|^\s*import i?pdb\b
 
 
 # ---------------------------------------------------------------- helpers
-def run(cmd, cwd, timeout=None, shell=False, extra_env=None):
+def run(cmd, cwd, timeout=None, shell=False, extra_env=None, encoding=None, errors="replace"):
+    """encoding=None: locale encoding (right for test-runner output)."""
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-                          shell=shell, errors="replace", env=env)
+                          shell=shell, encoding=encoding, errors=errors, env=env)
 
 
 GIT_SAFE = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-c", "diff.external=",
@@ -87,7 +88,10 @@ GIT_ENV = {"GIT_ATTR_SOURCE": EMPTY_TREE, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMIN
 def git(args, root):
     if args and args[0] == "diff":
         args = ["diff", "--no-ext-diff", "--no-textconv", *args[1:]]
-    return run(["git", *GIT_SAFE, *args], root, extra_env=GIT_ENV)
+    # Git emits raw UTF-8 path bytes on every OS; never decode them with the locale (cp1252 on
+    # Windows). surrogateescape keeps invalid bytes lossless for reopening the file.
+    return run(["git", *GIT_SAFE, *args], root, extra_env=GIT_ENV, encoding="utf-8",
+               errors="surrogateescape")
 
 
 def is_git(root: Path) -> bool:
@@ -111,30 +115,43 @@ def state_dir(root: Path) -> Path:
 NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 DIRFLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
 DIR_FD_OK = os.open in os.supports_dir_fd and NOFOLLOW != 0
+WINDOWS = os.name == "nt"
+O_BINARY = getattr(os, "O_BINARY", 0)  # Windows: text mode would stop at Ctrl-Z and translate CRLF
+
+
+def _bad_component(x: str) -> bool:
+    # On Windows "\\" is a separator and ":" selects drives/alternate data streams.
+    return x in ("", ".", "..") or "\0" in x or (WINDOWS and ("\\" in x or ":" in x))
 MAX_STATE_BYTES = 4 * 1024 * 1024
+
+
+def _fsname(name: str):
+    """POSIX: the exact bytes git reported, independent of the locale's filesystem encoding."""
+    return name.encode("utf-8", "surrogateescape")
 
 
 def _parent_fd(base: Path, relpath: str):
     """Open the parent dir of base/relpath one component at a time, never following
     symlinks (race-free against swapped components). Returns (dir_fd, last_name)."""
     parts = relpath.split("/")
-    if not relpath or relpath.startswith("/") or any(x in ("", ".", "..") for x in parts):
+    if not relpath or relpath.startswith("/") or any(_bad_component(x) for x in parts):
         raise OSError("unsafe relative path")
     if not DIR_FD_OK:  # fallback (e.g. Windows): containment check, small TOCTOU window
         parent = (base / relpath).parent
-        if os.path.realpath(parent) != os.path.join(os.path.realpath(base), *parts[:-1]):
+        expected = os.path.join(os.path.realpath(base), *parts[:-1])
+        if os.path.normcase(os.path.realpath(parent)) != os.path.normcase(expected):  # symlinks/junctions
             raise OSError("symlinked parent")
         return None, str(base / relpath)
     fd = os.open(base, DIRFLAGS)
     try:
         for comp in parts[:-1]:
-            nfd = os.open(comp, DIRFLAGS | NOFOLLOW, dir_fd=fd)
+            nfd = os.open(_fsname(comp), DIRFLAGS | NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nfd
     except OSError:
         os.close(fd)
         raise
-    return fd, parts[-1]
+    return fd, _fsname(parts[-1])
 
 
 def _open_rel(base: Path, relpath: str):
@@ -143,7 +160,7 @@ def _open_rel(base: Path, relpath: str):
     try:
         if dfd is None and os.path.islink(name):
             raise OSError("symlink")
-        fd = os.open(name, os.O_RDONLY | NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+        fd = os.open(name, os.O_RDONLY | O_BINARY | NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
                      **({"dir_fd": dfd} if dfd is not None else {}))
     finally:
         if dfd is not None:
@@ -158,7 +175,7 @@ def read_bytes(base: Path, relpath: str, limit=MAX_READ_BYTES):
     try:
         with _open_rel(base, relpath) as f:
             data = f.read(limit + 1)
-    except OSError:
+    except (OSError, ValueError):  # ValueError: name not encodable / embedded NUL
         return None
     return None if len(data) > limit else data
 
@@ -180,17 +197,23 @@ def save_json(path: Path, data):
     except FileExistsError:
         pass
     st = os.lstat(d)
-    if not stat.S_ISDIR(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+    junction = getattr(os.path, "isjunction", lambda _: False)(d)  # Python 3.12+ on Windows
+    if not stat.S_ISDIR(st.st_mode) or junction or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
         sys.exit(f"changeguard: refusing unsafe state directory {d} (symlink or not owned by you)")
     body = json.dumps(data, indent=1).encode()
     tmp = f".tmp-{os.getpid()}-{time.time_ns()}-{path.name}"
     if not DIR_FD_OK:
-        (d / tmp).write_bytes(body)
-        os.replace(d / tmp, path)
+        try:
+            fd = os.open(d / tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_BINARY, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+            os.replace(d / tmp, path)
+        except OSError as e:
+            sys.exit(f"changeguard: could not write state file {path}: {e}")
         return
     dfd = os.open(d, DIRFLAGS | NOFOLLOW)  # fails if d was swapped for a symlink
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=dfd)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | O_BINARY, 0o600, dir_fd=dfd)
         with os.fdopen(fd, "wb") as f:
             f.write(body)
         os.replace(tmp, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)  # replaces links, never follows
@@ -221,14 +244,15 @@ def sha1(root: Path, relpath: str):
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         return h.hexdigest()
-    except OSError:
+    except (OSError, ValueError):
         try:  # symlink: hash its target text, as git does
-            return "link:" + os.readlink(root / relpath)
-        except OSError:
+            return "link:" + os.fsdecode(os.readlink(_fsname(str(root / relpath)) if DIR_FD_OK
+                                                    else root / relpath))
+        except (OSError, ValueError):
             return "missing"
 
 
-CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\n]")
+CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\ud800-\udfff\n]")
 
 
 def safe(text) -> str:
@@ -626,7 +650,8 @@ def detect_runner(root: Path, files):
 
 def safe_relpath(p: str) -> bool:
     parts = p.split("/")
-    return bool(p) and not p.startswith("/") and ".." not in parts and "\0" not in p
+    risky = [x for x in parts if x not in ("", ".")]  # "./x" and "a//b" stay allowed
+    return bool(p) and not p.startswith("/") and not any(_bad_component(x) for x in risky)
 
 
 def build_cmd(runner, files):
@@ -807,6 +832,11 @@ def main(argv=None):
     t.add_argument("--timeout", type=int, default=600)
     t.add_argument("--tail", type=int, default=25, help="output lines shown on failure")
     a = ap.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # never crash on names the console encoding lacks
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     return {"scope": cmd_scope, "check": cmd_check, "test": cmd_test}[a.command](a)
 
 

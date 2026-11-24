@@ -26,7 +26,14 @@ ChangeGuard runs inside a coding agent's session on repositories that may contai
 - **Git older than 2.40** ignores `GIT_ATTR_SOURCE`. There, a repository that ships both a `.gitattributes` `filter=` entry and a matching `filter.<name>.clean` in its own `.git/config` can still run a clean filter during `check`. Use git 2.40 or later with untrusted repositories.
 - **Ignoring attributes changes diffs.** Git LFS and other filtered files may show as modified (raw content vs. index). Repo-defined diff drivers aren't used.
 - **Prompt injection** is mitigated by escaping and instructions, not eliminated. An agent can still be persuaded by plausible-looking text in code or test output, so review HIGH-impact actions.
-- **Windows and other platforms without `dir_fd`/`O_NOFOLLOW`** use a fallback: a realpath containment check plus `islink`. That fallback has a small time-of-check/time-of-use window and is not covered by CI here.
+- **Windows** has no `dir_fd`/`O_NOFOLLOW`, so ChangeGuard uses a fallback:
+  - A case-insensitive realpath containment check catches symlinked or junctioned parent folders. `islink` catches symlinked files.
+  - Junction state folders are refused (Python 3.12 or later).
+  - Paths containing `\` or `:` (drives, alternate data streams) are rejected.
+  - Files are opened in binary mode, so Ctrl-Z can't truncate a scan.
+  - Output is written with `backslashreplace`, so legacy console encodings can't crash it.
+  - Remaining gaps: a small time-of-check/time-of-use window between the containment check and the open, because a component can be swapped in between. There is no owner check on the state folder (no POSIX uid). Hard links aren't detected; this applies on every OS, though Linux usually restricts cross-user hard links. The junction and Ctrl-Z tests have only been run on Windows by users, not in CI here.
+- **`--cmd` uses the platform shell:** `sh` on POSIX, `cmd.exe` on Windows. Write commands for the platform you're on, or use a portable `python -c ...` form.
 - **Detection is heuristic.** Missing findings don't prove a change is safe.
 
 ## Reporting a vulnerability
