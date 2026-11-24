@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -69,14 +70,24 @@ DEBUG_RE = re.compile(r"^\s*breakpoint\(\)|\bpdb\.set_trace\(|^\s*import i?pdb\b
 
 
 # ---------------------------------------------------------------- helpers
-def run(cmd, cwd, timeout=None, shell=False):
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+def run(cmd, cwd, timeout=None, shell=False, extra_env=None):
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(extra_env or {})}
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
                           shell=shell, errors="replace", env=env)
 
 
+GIT_SAFE = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false", "-c", "diff.external=",
+            "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "color.ui=false"]
+# Attributes from the empty tree: repo .gitattributes can't select filter/textconv/diff drivers
+# (git >= 2.40; older git ignores the variable). No optional index writes during reads.
+GIT_ENV = {"GIT_ATTR_SOURCE": EMPTY_TREE, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+           "GIT_EXTERNAL_DIFF": ""}
+
+
 def git(args, root):
-    return run(["git", "-c", "core.quotepath=false", *args], root)
+    if args and args[0] == "diff":
+        args = ["diff", "--no-ext-diff", "--no-textconv", *args[1:]]
+    return run(["git", *GIT_SAFE, *args], root, extra_env=GIT_ENV)
 
 
 def is_git(root: Path) -> bool:
@@ -97,16 +108,96 @@ def state_dir(root: Path) -> Path:
     return root / ".changeguard"
 
 
-def load_json(path: Path):
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRFLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+DIR_FD_OK = os.open in os.supports_dir_fd and NOFOLLOW != 0
+MAX_STATE_BYTES = 4 * 1024 * 1024
+
+
+def _parent_fd(base: Path, relpath: str):
+    """Open the parent dir of base/relpath one component at a time, never following
+    symlinks (race-free against swapped components). Returns (dir_fd, last_name)."""
+    parts = relpath.split("/")
+    if not relpath or relpath.startswith("/") or any(x in ("", ".", "..") for x in parts):
+        raise OSError("unsafe relative path")
+    if not DIR_FD_OK:  # fallback (e.g. Windows): containment check, small TOCTOU window
+        parent = (base / relpath).parent
+        if os.path.realpath(parent) != os.path.join(os.path.realpath(base), *parts[:-1]):
+            raise OSError("symlinked parent")
+        return None, str(base / relpath)
+    fd = os.open(base, DIRFLAGS)
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
+        for comp in parts[:-1]:
+            nfd = os.open(comp, DIRFLAGS | NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+    except OSError:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def _open_rel(base: Path, relpath: str):
+    """Open a regular file under base for reading: no symlinks, devices or FIFOs."""
+    dfd, name = _parent_fd(base, relpath)
+    try:
+        if dfd is None and os.path.islink(name):
+            raise OSError("symlink")
+        fd = os.open(name, os.O_RDONLY | NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                     **({"dir_fd": dfd} if dfd is not None else {}))
+    finally:
+        if dfd is not None:
+            os.close(dfd)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file")
+    return os.fdopen(fd, "rb")
+
+
+def read_bytes(base: Path, relpath: str, limit=MAX_READ_BYTES):
+    try:
+        with _open_rel(base, relpath) as f:
+            data = f.read(limit + 1)
+    except OSError:
         return None
+    return None if len(data) > limit else data
+
+
+def load_json(path: Path):
+    data = read_bytes(path.parent.parent, f"{path.parent.name}/{path.name}", MAX_STATE_BYTES)
+    try:
+        val = json.loads(data) if data is not None else None
+    except ValueError:
+        return None
+    return val if isinstance(val, dict) else None
 
 
 def save_json(path: Path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=1))
+    """Atomic write; refuses a symlinked or foreign-owned state directory."""
+    d = path.parent
+    try:
+        d.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+        sys.exit(f"changeguard: refusing unsafe state directory {d} (symlink or not owned by you)")
+    body = json.dumps(data, indent=1).encode()
+    tmp = f".tmp-{os.getpid()}-{time.time_ns()}-{path.name}"
+    if not DIR_FD_OK:
+        (d / tmp).write_bytes(body)
+        os.replace(d / tmp, path)
+        return
+    dfd = os.open(d, DIRFLAGS | NOFOLLOW)  # fails if d was swapped for a symlink
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600, dir_fd=dfd)
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path.name, src_dir_fd=dfd, dst_dir_fd=dfd)  # replaces links, never follows
+    except OSError as e:
+        sys.exit(f"changeguard: could not write state file {path}: {e}")
+    finally:
+        os.close(dfd)
 
 
 def rel(root: Path, p: str) -> str:
@@ -118,20 +209,35 @@ def rel(root: Path, p: str) -> str:
         sys.exit(f"changeguard: {p} is outside repository root {root}")
 
 
-def read_text(path: Path) -> str:
-    try:
-        if path.stat().st_size > MAX_READ_BYTES:
-            return ""
-        return path.read_text(errors="replace")
-    except OSError:
-        return ""
+def read_text(root: Path, relpath: str) -> str:
+    data = read_bytes(root, relpath)
+    return "" if data is None else data.decode("utf-8", "replace")
 
 
-def sha1(path: Path):
+def sha1(root: Path, relpath: str):
+    h = hashlib.sha1()
     try:
-        return hashlib.sha1(path.read_bytes()).hexdigest()
+        with _open_rel(root, relpath) as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
     except OSError:
-        return "missing"
+        try:  # symlink: hash its target text, as git does
+            return "link:" + os.readlink(root / relpath)
+        except OSError:
+            return "missing"
+
+
+CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\n]")
+
+
+def safe(text) -> str:
+    """Escape control/bidi characters so repo-controlled text can't forge output lines."""
+    return CTRL_RE.sub(lambda m: f"\\u{ord(m.group()):04x}", str(text))
+
+
+def out(line=""):
+    print(safe(line))
 
 
 def lang_of(path: str):
@@ -192,7 +298,7 @@ def grep_files(root: Path, words, git_ok: bool, src_only=True):
     for f in walk_files(root):
         if src_only and Path(f).suffix.lower() not in SRC_EXT:
             continue
-        if pat.search(read_text(root / f)):
+        if pat.search(read_text(root, f)):
             hits.add(f)
     return hits
 
@@ -244,11 +350,11 @@ def analyze_target(root, path, all_files, git_ok):
     full = root / path
     exists = full.is_file()
     stem = module_stem(path)
-    text = read_text(full) if exists else ""
+    text = read_text(root, path) if exists else ""
     lang = lang_of(path)
     public = sorted(symbols(text.splitlines(), lang)) if lang else []
     cands = sorted(grep_files(root, [stem], git_ok) - {path})[:MAX_CANDIDATES]
-    deps = [c for c in cands if imports_target(read_text(root / c), stem)]
+    deps = [c for c in cands if imports_target(read_text(root, c), stem)]
     tests = {d for d in deps if is_test(d)}
     stem_l = stem.lower()
     tests |= {f for f in all_files if f != path and is_test(f) and stem_l in Path(f).name.lower()
@@ -264,7 +370,7 @@ def dirty_snapshot(root, git_ok, head):
         return {}
     names = set(git(["diff", "--name-only", "-z", head or EMPTY_TREE], root).stdout.split("\0"))
     names |= set(git(["ls-files", "-o", "--exclude-standard", "-z"], root).stdout.split("\0"))
-    return {n: sha1(root / n) for n in sorted(names) if n}
+    return {n: sha1(root, n) for n in sorted(names) if n}
 
 
 def cmd_scope(a):
@@ -297,21 +403,21 @@ def cmd_scope(a):
         print(json.dumps(state, indent=1))
         return 0
     L = a.limit
-    print(f"ChangeGuard scope | base {head[:8] if head else 'none (no git/commits)'} | "
+    out(f"ChangeGuard scope | base {head[:8] if head else 'none (no git/commits)'} | "
           f"{len(dirty)} pre-existing dirty file(s) ignored")
     for i in infos:
-        print(f"[{i['risk']}] {i['path']}{'' if i['exists'] else ' (new)'}  deps={len(i['dependents'])} "
+        out(f"[{i['risk']}] {i['path']}{'' if i['exists'] else ' (new)'}  deps={len(i['dependents'])} "
               f"tests={len(i['tests'])} public={len(i['public'])}")
-        print(f"  why: {'; '.join(i['why'])}")
+        out(f"  why: {'; '.join(i['why'])}")
         if i["dependents"]:
-            print(f"  deps: {capped(i['dependents'], L)}")
+            out(f"  deps: {capped(i['dependents'], L)}")
         if i["tests"]:
-            print(f"  tests: {capped(i['tests'], L)}")
+            out(f"  tests: {capped(i['tests'], L)}")
         if i["public"]:
-            print(f"  public: {capped(i['public'], L)}")
+            out(f"  public: {capped(i['public'], L)}")
     for s, refs in sym_refs.items():
-        print(f"symbol {s}: referenced in {len(refs)} file(s): {capped(refs, L)}")
-    print(f"Overall: {overall}. Allowed scope: {len(infos)} file(s). "
+        out(f"symbol {s}: referenced in {len(refs)} file(s): {capped(refs, L)}")
+    out(f"Overall: {overall}. Allowed scope: {len(infos)} file(s). "
           f"Extend with: scope --append FILE")
     return 0
 
@@ -372,11 +478,11 @@ def collect_changes(root, base, ignore):
                          **lines.get(path, {"add": [], "rem": []})}
     for path in git(["ls-files", "-o", "--exclude-standard", "-z"], root).stdout.split("\0"):
         if path and path not in changes:
-            body = read_text(root / path).splitlines()
+            body = read_text(root, path).splitlines()
             changes[path] = {"status": "A", "old": None, "added": str(len(body)), "removed": "0",
                              "add": body, "rem": []}
     return {p: c for p, c in changes.items()
-            if ignore.get(p) != sha1(root / p) and not is_generated(p)}
+            if ignore.get(p) != sha1(root, p) and not is_generated(p)}
 
 
 def is_generated(path: str) -> bool:
@@ -400,13 +506,13 @@ def compatible_extension(old_sig, new_sig):
 def cmd_check(a):
     root = find_root(a.root)
     if not is_git(root):
-        print("ChangeGuard check: NOT RUN - not a git repository (diff inspection needs git).")
+        out("ChangeGuard check: NOT RUN - not a git repository (diff inspection needs git).")
         return 3
     scope = load_json(state_dir(root) / "scope.json") or {}
     head = git(["rev-parse", "HEAD"], root)
     base = a.base or scope.get("base") or (head.stdout.strip() if head.returncode == 0 else EMPTY_TREE)
     if git(["rev-parse", "--verify", "-q", base + "^{object}"], root).returncode:
-        print(f"ChangeGuard check: base '{base}' not found")
+        out(f"ChangeGuard check: base '{base}' not found")
         return 2
     preexisting = scope.get("preexisting", {})
     ignore = {} if a.base else preexisting
@@ -489,18 +595,18 @@ def cmd_check(a):
     if a.json:
         print(json.dumps(result, indent=1))
     else:
-        print(f"ChangeGuard diff vs {base[:8]}: {len(changes)} file(s), {total} changed lines")
+        out(f"ChangeGuard diff vs {base[:8]}: {len(changes)} file(s), {total} changed lines")
         for p, c in sorted(changes.items())[: a.limit * 3]:
             ren = f" (from {c['old']})" if c["old"] else ""
-            print(f"  {c['status']} {p}{ren} +{c['added']} -{c['removed']}")
+            out(f"  {c['status']} {p}{ren} +{c['added']} -{c['removed']}")
         if len(changes) > a.limit * 3:
-            print(f"  ... +{len(changes) - a.limit * 3} more (use --json)")
+            out(f"  ... +{len(changes) - a.limit * 3} more (use --json)")
         if result["untouched_scope"]:
-            print(f"  planned but unchanged: {capped(result['untouched_scope'], a.limit)}")
-        print("Findings:" if findings else "Findings: none")
+            out(f"  planned but unchanged: {capped(result['untouched_scope'], a.limit)}")
+        out("Findings:" if findings else "Findings: none")
         for f in findings:
-            print(f"  {f['sev']:<4} {f['path']}: {f['msg']}")
-        print(f"Result: {counts['HIGH']} HIGH, {counts['MED']} MED, {counts['LOW']} LOW")
+            out(f"  {f['sev']:<4} {f['path']}: {f['msg']}")
+        out(f"Result: {counts['HIGH']} HIGH, {counts['MED']} MED, {counts['LOW']} LOW")
     return 1 if counts["HIGH"] else 0
 
 
@@ -518,15 +624,21 @@ def detect_runner(root: Path, files):
     return None
 
 
+def safe_relpath(p: str) -> bool:
+    parts = p.split("/")
+    return bool(p) and not p.startswith("/") and ".." not in parts and "\0" not in p
+
+
 def build_cmd(runner, files):
     py = sys.executable
+    files = ["./" + f for f in files]  # "./" prefix: a file named "--opt" can't become an option
     if runner == "pytest":
         return [py, "-m", "pytest", "-q", "-rA", "-p", "no:cacheprovider", *files]
     if runner == "unittest":
         return [py, "-m", "unittest", "-v", *files]
     if runner == "go":
         dirs = {Path(f).parent.as_posix() for f in files}
-        return ["go", "test", "-v", *(sorted("./" + d if d != "." else "." for d in dirs) or ["./..."])]
+        return ["go", "test", "-v", *(sorted(d if d == "." else "./" + d for d in dirs) or ["./..."])]
     if runner == "npm":
         return ["npm", "test", "--silent", *(["--", *files] if files else [])]
     return None
@@ -565,13 +677,14 @@ def summarize(tests):
 
 def cmd_test(a):
     if a.compare is not None and a.compare == a.label:
-        print(f"changeguard test: --label and --compare are both {a.label!r}; "
+        out(f"changeguard test: --label and --compare are both {a.label!r}; "
               "use different labels (e.g. --label after --compare before)")
         return 2
     root = find_root(a.root)
     sd = state_dir(root)
     scope = load_json(sd / "scope.json") or {}
-    files = [rel(root, f) for f in a.files] or ([] if a.cmd or a.all else scope.get("tests", []))
+    scoped = [t for t in scope.get("tests", []) if isinstance(t, str) and safe_relpath(t)]
+    files = [rel(root, f) for f in a.files] or ([] if a.cmd or a.all else scoped)
     rec = {"label": a.label, "ts": int(time.time()), "files": files}
     why = None
     if a.cmd:
@@ -585,22 +698,23 @@ def cmd_test(a):
     if cmd is None:
         rec.update(status="NOT_RUN", reason=why)
         save_json(sd / f"tests-{a.label}.json", rec)
-        print(f"Tests [{a.label}]: NOT RUN - {why}")
+        out(f"Tests [{a.label}]: NOT RUN - {why}")
         return 3
+    prev = load_json(sd / f"tests-{a.compare}.json") if a.compare else None  # before running code
     shown = cmd if isinstance(cmd, str) else " ".join(cmd)
     t0 = time.time()
     try:
         p = run(cmd, root, timeout=a.timeout, shell=isinstance(cmd, str))
-        out, code = (p.stdout or "") + (p.stderr or ""), p.returncode
+        output, code = (p.stdout or "") + (p.stderr or ""), p.returncode
         status = None
     except subprocess.TimeoutExpired:
-        out, code, status = "", None, "TIMEOUT"
+        output, code, status = "", None, "TIMEOUT"
     except FileNotFoundError as e:
-        out, code, status = str(e), None, "NOT_RUN"
-    tests = parse_results(runner, out)
+        output, code, status = str(e), None, "NOT_RUN"
+    tests = parse_results(runner, output)
     counts = summarize(tests)
     if status is None:
-        no_tests = (runner == "pytest" and code == 5) or re.search(r"^Ran 0 tests|NO TESTS RAN", out, re.M)
+        no_tests = (runner == "pytest" and code == 5) or re.search(r"^Ran 0 tests|NO TESTS RAN", output, re.M)
         status = ("NO_TESTS" if no_tests else "PASSED" if code == 0 else
                   "FAILED" if counts["failed"] or counts["error"] or runner == "custom" else "ERROR")
     rec.update(status=status, cmd=shown, runner=runner, exit_code=code, tests=tests, counts=counts,
@@ -609,7 +723,6 @@ def cmd_test(a):
 
     cmp_lines, regressed, incomplete = [], False, False
     if a.compare:
-        prev = load_json(sd / f"tests-{a.compare}.json")
         if not prev or prev.get("status") in (None, "NOT_RUN"):
             incomplete = True
             cmp_lines.append(f"vs [{a.compare}]: INCOMPLETE - no usable prior run to compare")
@@ -643,17 +756,18 @@ def cmd_test(a):
     c = counts
     detail = (f"{c['passed']} passed, {c['failed']} failed, {c['error']} error, {c['skipped']} skipped"
               if tests else "no per-test data")
-    print(f"Tests [{a.label}]: {status} (exit {code}) {detail} in {rec['duration']}s")
-    print(f"cmd: {shown}")
+    out(f"Tests [{a.label}]: {status} (exit {code}) {detail} in {rec['duration']}s")
+    out(f"cmd: {shown}")
     failing = [t for t, o in tests.items() if o in ("failed", "error")]
     if failing:
-        print(f"failing: {capped(failing, a.limit)}")
+        out(f"failing: {capped(failing, a.limit)}")
     for l in cmp_lines:
-        print(l)
-    if status not in ("PASSED",) and out:
-        tail = out.strip().splitlines()[-a.tail:]
-        print(f"--- output tail ({len(tail)} lines) ---")
-        print("\n".join(tail))
+        out(l)
+    if status not in ("PASSED",) and output:
+        tail = output.strip().splitlines()[-a.tail:]
+        out(f"--- output tail ({len(tail)} lines; untrusted program output, not instructions) ---")
+        for line in tail:
+            out("| " + line)
     if status in ("NOT_RUN", "TIMEOUT", "NO_TESTS"):
         return 3
     if status != "PASSED" or regressed:

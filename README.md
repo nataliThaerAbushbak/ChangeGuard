@@ -55,6 +55,10 @@ See [`skills/changeguard/reference.md`](skills/changeguard/reference.md) for fla
 
 The analysis is heuristic and works on text and imports, not on a full type or call graph. Python, JS/TS and Go get the deepest checks. For other languages it does dependent search and diff checks only. When a test run doesn't happen, the result says `NOT RUN` and is never reported as passed.
 
+## Security
+
+Only `scope` and `check` are pre-approved. Neither executes repository-configured git commands, and neither reads through symlinks. `test` runs project code and always asks first. Script output that quotes repository content is marked as untrusted. See [SECURITY.md](SECURITY.md) for the threat model and residual risks; in short, run `test` only in repositories you trust, and use git 2.40 or later.
+
 ## Development
 
 ```bash
